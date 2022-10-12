@@ -27,6 +27,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Mangler.h"
@@ -128,6 +129,10 @@ class ModuleSanitizerCoverageAFL
     : public PassInfoMixin<ModuleSanitizerCoverageAFL> {
 
  public:
+
+    GlobalVariable* global_fp;
+    Type *io_file_ptr_type;
+
   ModuleSanitizerCoverageAFL(
       const SanitizerCoverageOptions &Options = SanitizerCoverageOptions())
       : Options(OverrideFromCL(Options)) {
@@ -140,16 +145,19 @@ class ModuleSanitizerCoverageAFL
                         PostDomTreeCallback PDTCallback);
 
  private:
+
+    void AddObj(Module &M, Function *F, Instruction *IN, CmpInst *cmp_inst);
+
   void instrumentFunction(Function &F, DomTreeCallback DTCallback,
                           PostDomTreeCallback PDTCallback);
-  void InjectCoverageForIndirectCalls(Function               &F,
+  void InjectCoverageForIndirectCalls(Function &              F,
                                       ArrayRef<Instruction *> IndirCalls);
   void InjectTraceForCmp(Function &F, ArrayRef<Instruction *> CmpTraceTargets);
-  void InjectTraceForDiv(Function                  &F,
+  void InjectTraceForDiv(Function &                 F,
                          ArrayRef<BinaryOperator *> DivTraceTargets);
-  void InjectTraceForGep(Function                     &F,
+  void InjectTraceForGep(Function &                    F,
                          ArrayRef<GetElementPtrInst *> GepTraceTargets);
-  void InjectTraceForSwitch(Function               &F,
+  void InjectTraceForSwitch(Function &              F,
                             ArrayRef<Instruction *> SwitchTraceTargets);
   bool InjectCoverage(Function &F, ArrayRef<BasicBlock *> AllBlocks,
                       bool IsLeafFunc = true);
@@ -166,6 +174,11 @@ class ModuleSanitizerCoverageAFL
                                        const char *Section);
   std::pair<Value *, Value *> CreateSecStartEnd(Module &M, const char *Section,
                                                 Type *Ty);
+
+  bool insert_on_main_entry_block(BasicBlock &F, Module &M); 
+  bool insert_on_main_end_block(BasicBlock &F, Module &M); 
+    
+  void insert_extern_fp(Module &M);
 
   void SetNoSanitizeMetadata(Instruction *I) {
 
@@ -187,10 +200,10 @@ class ModuleSanitizerCoverageAFL
   GlobalVariable *SanCovLowestStack;
   Type *IntptrTy, *IntptrPtrTy, *Int64Ty, *Int64PtrTy, *Int32Ty, *Int32PtrTy,
       *Int16Ty, *Int8Ty, *Int8PtrTy, *Int1Ty, *Int1PtrTy;
-  Module           *CurModule;
+  Module *          CurModule;
   std::string       CurModuleUniqueId;
   Triple            TargetTriple;
-  LLVMContext      *C;
+  LLVMContext *     C;
   const DataLayout *DL;
 
   GlobalVariable *FunctionGuardArray;        // for trace-pc-guard.
@@ -204,14 +217,91 @@ class ModuleSanitizerCoverageAFL
 
   uint32_t        instr = 0, selects = 0, unhandled = 0;
   GlobalVariable *AFLMapPtr = NULL;
-  ConstantInt    *One = NULL;
-  ConstantInt    *Zero = NULL;
+  ConstantInt *   One = NULL;
+  ConstantInt *   Zero = NULL;
+
+};
+
+
+
+Value* get_ptr_expr_from_str(Module& M, std::string str, std::string name) { 
+    Constant* constant_str = ConstantDataArray::getString(M.getContext(), str, true); 
+    GlobalVariable* str_var = new GlobalVariable(M, constant_str->getType(),
+            true, llvm::GlobalValue::InternalLinkage, constant_str, name);
+    Constant* const_zero  = ConstantInt::get(Type::getInt32Ty(M.getContext()), 0);
+    PointerType *pty = dyn_cast<PointerType>(str_var->getType()); 
+    Constant* const_array = ConstantExpr::getInBoundsGetElementPtr
+        (pty->getElementType(), str_var, const_zero); 
+    Value* str_ptr = ConstantExpr::getBitCast(const_array, 
+            PointerType::getUnqual(Type::getInt8Ty(M.getContext())));
+//    llvm::outs() << "\nThis is the str_ptr " << str << "\n";
+//    str_ptr->print(llvm::outs());
+    return str_ptr;
+}
+
+
+Value* ret_loaded_var(Module &M, Type* typ, Value* val, std::string label, Instruction* IN) {  
+    auto var = new AllocaInst(typ, 0, label, IN);
+    auto store = new StoreInst(val, var, IN); 
+    auto load = new LoadInst(var->getType()->getElementType(), var, label, IN);
+    return load;
+} 
+
+
+class ModuleSanitizerCoverageLegacyPass : public ModulePass {
+
+ public:
+  ModuleSanitizerCoverageLegacyPass(
+      const SanitizerCoverageOptions &Options = SanitizerCoverageOptions())
+      : ModulePass(ID), Options(Options) {
+
+    initializeModuleSanitizerCoverageLegacyPassPass(
+        *PassRegistry::getPassRegistry());
+
+  }
+
+  bool runOnModule(Module &M) override {
+
+    ModuleSanitizerCoverageAFL ModuleSancov(Options);
+    auto DTCallback = [this](Function &F) -> const DominatorTree * {
+
+      return &this->getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
+
+    };
+
+    auto PDTCallback = [this](Function &F) -> const PostDominatorTree * {
+
+      return &this->getAnalysis<PostDominatorTreeWrapperPass>(F)
+                  .getPostDomTree();
+
+    };
+
+    return ModuleSancov.instrumentModule(M, DTCallback, PDTCallback);
+
+  }
+
+  /*static*/ char ID;  // Pass identification, replacement for typeid
+  StringRef       getPassName() const override {
+
+    return "ModuleSanitizerCoverage";
+
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+
+    AU.addRequired<DominatorTreeWrapperPass>();
+    AU.addRequired<PostDominatorTreeWrapperPass>();
+
+  }
+
+ private:
+  SanitizerCoverageOptions Options;
 
 };
 
 }  // namespace
 
-#if LLVM_VERSION_MAJOR >= 11                        /* use new pass manager */
+#if 1
 
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
@@ -236,12 +326,12 @@ llvmGetPassPluginInfo() {
 
 #endif
 
-PreservedAnalyses ModuleSanitizerCoverageAFL::run(Module                &M,
+PreservedAnalyses ModuleSanitizerCoverageAFL::run(Module &               M,
                                                   ModuleAnalysisManager &MAM) {
 
   ModuleSanitizerCoverageAFL ModuleSancov(Options);
   auto &FAM = MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
-  auto  DTCallback = [&FAM](Function &F) -> const DominatorTree  *{
+  auto  DTCallback = [&FAM](Function &F) -> const DominatorTree * {
 
     return &FAM.getResult<DominatorTreeAnalysis>(F);
 
@@ -262,25 +352,13 @@ PreservedAnalyses ModuleSanitizerCoverageAFL::run(Module                &M,
 std::pair<Value *, Value *> ModuleSanitizerCoverageAFL::CreateSecStartEnd(
     Module &M, const char *Section, Type *Ty) {
 
-  GlobalVariable *SecStart =
-      new GlobalVariable(M,
-#if LLVM_VERSION_MAJOR >= 15
-                         Ty,
-#else
-                         Ty->getPointerElementType(),
-#endif
-                         false, GlobalVariable::ExternalWeakLinkage, nullptr,
-                         getSectionStart(Section));
+  GlobalVariable *SecStart = new GlobalVariable(
+      M, Ty->getPointerElementType(), false,
+      GlobalVariable::ExternalWeakLinkage, nullptr, getSectionStart(Section));
   SecStart->setVisibility(GlobalValue::HiddenVisibility);
-  GlobalVariable *SecEnd =
-      new GlobalVariable(M,
-#if LLVM_VERSION_MAJOR >= 15
-                         Ty,
-#else
-                         Ty->getPointerElementType(),
-#endif
-                         false, GlobalVariable::ExternalWeakLinkage, nullptr,
-                         getSectionEnd(Section));
+  GlobalVariable *SecEnd = new GlobalVariable(
+      M, Ty->getPointerElementType(), false,
+      GlobalVariable::ExternalWeakLinkage, nullptr, getSectionEnd(Section));
   SecEnd->setVisibility(GlobalValue::HiddenVisibility);
   IRBuilder<> IRB(M.getContext());
   if (!TargetTriple.isOSBinFormatCOFF())
@@ -336,6 +414,148 @@ Function *ModuleSanitizerCoverageAFL::CreateInitCallsForSections(
 
 }
 
+
+bool IsInterestingCmp(ICmpInst *CMP, const DominatorTree *DT,
+                      const SanitizerCoverageOptions &Options);
+
+
+
+bool ModuleSanitizerCoverageAFL::insert_on_main_entry_block(BasicBlock &F, Module &M) {
+    llvm::outs() <<  "inserting on main entry... \n"; 
+
+    // Get the first instruction in this block
+    Instruction *inst = F.getFirstNonPHI();
+
+    int is_return = 0;
+    if (ReturnInst *r = dyn_cast<ReturnInst>(inst)) {
+        // hmm looks like main is *empty
+        llvm::outs() <<  "main is empty...returning\n"; 
+        is_return = 1;
+        //return false ;
+	//return true;
+    }
+    llvm::outs() <<  "inserting on main entry2... \n"; 
+
+//    llvm::outs() << "inst = " << inst << " \n";
+
+    // FILE * fp
+    StructType* io_file_struct_type = StructType::create(M.getContext(), "struct._IO_FILE");
+    io_file_ptr_type = PointerType::getUnqual(io_file_struct_type);
+
+    // FILE * fopen (const char *,  const char *);  
+    Function* fopen_fn; 
+    if (M.getFunction("fopen")) {
+        fopen_fn = M.getFunction("fopen"); 
+        llvm::outs() << "got fopen\n";
+    } else {
+        FunctionCallee fopen_func = M.getOrInsertFunction("fopen", 
+                io_file_ptr_type, 
+                Type::getInt8PtrTy(M.getContext()),
+                Type::getInt8PtrTy(M.getContext())); 
+        printf("%p\b", dyn_cast<Function>(fopen_func.getCallee()));
+        fopen_fn = dyn_cast<Function>(fopen_func.getCallee());
+        llvm::outs() << "created fopen\n";
+    }
+    if (!fopen_fn) {
+        printf("Fopen was not found\n"); 
+        exit(1);
+    } 
+
+    // Arg 1: Create a global string with file name, "results.txt"
+    Value* file_ptr = get_ptr_expr_from_str(M, "results.txt", "results"); 
+
+    // Arg 2: Create a global format string for "a"  
+    Value* fmt_ptr = get_ptr_expr_from_str(M, "a", "fopen_option"); 
+ 
+    // Args vector
+    std::vector<Value*> args;
+    args.push_back(file_ptr);
+    args.push_back(fmt_ptr);
+
+//    llvm::outs() << "here 11 \n";
+
+    Instruction* fp = CallInst::Create(fopen_fn, args, "", inst->getNextNode()); 
+
+    // Create the global file pointer 
+    M.getOrInsertGlobal("global_fp", fp->getType()); 
+                        llvm::outs() << "\nhere1a " << fp << " \n";
+                        llvm::outs() << "\nhere1a " << fp->getType() << " \n";
+    global_fp  = M.getNamedGlobal("global_fp"); 
+                        llvm::outs() << "\nhere1b " << global_fp << " \n";
+    global_fp->setLinkage(llvm::GlobalValue::CommonLinkage);
+    global_fp->setAlignment(Align(8));
+
+    llvm::outs() << "here 12 \n";
+
+    PointerType* pt = dyn_cast<PointerType>(fp->getType()); 
+    Constant* init_null  = ConstantPointerNull::get(pt);
+    global_fp->setInitializer(init_null);
+
+    llvm::outs() << "here 14 \n";
+
+    llvm::outs() << " fp : " << fp << "\n";
+    llvm::outs() << " global_fp : " << global_fp << "\n";
+    
+    fp->getNextNode(); 
+    llvm::outs() << "here 15 \n";
+    llvm::outs() << " fp : " << fp->getNextNode() << "\n";
+
+     StoreInst* stinst; 
+    if (is_return) { 
+        stinst = new StoreInst(fp, global_fp, inst);
+    } else {
+
+        stinst = new StoreInst(fp, global_fp, fp->getNextNode());
+    }
+
+    llvm::outs() << "here 16 \n";
+
+
+
+    return true;
+
+}
+
+void ModuleSanitizerCoverageAFL::insert_extern_fp(Module &M) {
+
+    // FILE * fp
+    StructType* io_file_struct_type = StructType::create(M.getContext(), "struct._IO_FILE");
+    io_file_ptr_type = PointerType::getUnqual(io_file_struct_type);
+   
+    M.getOrInsertGlobal("global_fp", io_file_ptr_type); 
+    global_fp  = M.getNamedGlobal("global_fp"); 
+    global_fp->setLinkage(llvm::GlobalValue::ExternalLinkage);
+    global_fp->setAlignment(Align(8));
+
+}
+
+
+bool ModuleSanitizerCoverageAFL::insert_on_main_end_block(BasicBlock &F, Module &M) {
+    llvm::outs() <<  "inserting on main end... \n"; 
+    Instruction *inst = F.getTerminator();
+    LLVMContext& ctx = M.getContext(); 
+
+    // int fclose(FILE*);
+    Function* fclose_fn; 
+    if (M.getFunction("fclose")) { 
+        fclose_fn = M.getFunction("fclose"); 
+    } else { 
+        FunctionCallee const_fclose = M.getOrInsertFunction("fclose", 
+                FunctionType::get(Type::getInt32Ty(ctx), global_fp->getType()->getElementType(), true));
+        fclose_fn = cast<Function>(const_fclose.getCallee());
+    }
+//    printf("\nThis if fclose: \n");
+//    fclose_fn->print(llvm::outs()); 
+
+    Value* load_global_fp = new LoadInst(global_fp->getType()->getElementType(), 
+            global_fp, "lgfp", inst); 
+    CallInst* fclose_fn_call = CallInst::Create(fclose_fn, load_global_fp, "", inst); 
+    fclose_fn_call->setCallingConv(CallingConv::C);
+
+    return true;
+}
+
+
 bool ModuleSanitizerCoverageAFL::instrumentModule(
     Module &M, DomTreeCallback DTCallback, PostDomTreeCallback PDTCallback) {
 
@@ -359,7 +579,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   if (debug) {
 
     fprintf(stderr,
-            "SANCOV: covtype:%u indirect:%d stack:%d noprune:%d "
+            "SANCXXXOV: covtype:%u indirect:%d stack:%d noprune:%d "
             "createtable:%d tracepcguard:%d tracepc:%d\n",
             Options.CoverageType, Options.IndirectCalls == true ? 1 : 0,
             Options.StackDepth == true ? 1 : 0, Options.NoPrune == true ? 1 : 0,
@@ -382,7 +602,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   FunctionPCsArray = nullptr;
   IntptrTy = Type::getIntNTy(*C, DL->getPointerSizeInBits());
   IntptrPtrTy = PointerType::getUnqual(IntptrTy);
-  Type       *VoidTy = Type::getVoidTy(*C);
+  Type *      VoidTy = Type::getVoidTy(*C);
   IRBuilder<> IRB(*C);
   Int64PtrTy = PointerType::getUnqual(IRB.getInt64Ty());
   Int32PtrTy = PointerType::getUnqual(IRB.getInt32Ty());
@@ -394,6 +614,24 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   Int8Ty = IRB.getInt8Ty();
   Int1Ty = IRB.getInt1Ty();
   LLVMContext &Ctx = M.getContext();
+  
+    // determine if this module contains main
+    bool found_main = false;    
+    bool insert_success = false;
+    for(Module::iterator F = M.begin();  F != M.end(); ++F) 
+        if (F->getName() == "main") {
+            found_main = true;    
+            // we have main -- insert fopen of global fp
+            llvm::outs() << "found main -- inserting open of global fp\n";
+            insert_success = insert_on_main_entry_block(F->getEntryBlock(), M); 
+            insert_on_main_entry_block(F->getEntryBlock(), M); 
+        }
+    
+    if (!found_main) {
+        // no main -- insert extern of global fp
+        insert_extern_fp(M);
+    }
+
 
   AFLMapPtr =
       new GlobalVariable(M, PointerType::get(Int8Ty, 0), false,
@@ -468,8 +706,45 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   SanCovTracePCGuard =
       M.getOrInsertFunction(SanCovTracePCGuardName, VoidTy, Int32PtrTy);
 
-  for (auto &F : M)
-    instrumentFunction(F, DTCallback, PDTCallback);
+  
+
+  for (auto &F : M) {
+      instrumentFunction(F, DTCallback, PDTCallback);     
+//          llvm::outs() << "Fn name = " << F.getName() << "\n";
+      for (auto &BB : F) {
+//          llvm::outs() << " block\n";
+          const DominatorTree *    DT = DTCallback(F);
+          for (auto &Inst : BB) {
+//              llvm::outs() << "  instr =[" << Inst << "\n";
+              if (ICmpInst *CMP = dyn_cast<ICmpInst>(&Inst)) {
+//                  llvm::outs() << "   Icmp\n";
+                  if (IsInterestingCmp(CMP, DT, Options)) {
+//                      llvm::outs() << "... interesting\n";
+                      CmpInst* cmp_inst = dyn_cast<CmpInst>(&Inst);
+                      if (cmp_inst) {
+//                          llvm::outs() << "Adding objfn\n";                          
+                          Instruction *IN = &Inst;
+                          Function *Fp = &F;
+                          AddObj(M, Fp, IN, cmp_inst);
+//                          llvm::outs() << "back from Adding objfn\n";
+
+                      }                  
+                  }
+              }
+              if (SwitchInst *SWITCH = dyn_cast<SwitchInst>(&Inst)) {
+//                  llvm::outs() << "  Switch condition = [" << *SWITCH->getCondition() << "]\n";
+//                  for (auto c = SWITCH->case_begin(); c != SWITCH->case_end(); c++) {
+//                      llvm::outs() << "case : " << *c->getCaseValue() << "\n";
+//                  }
+              }
+          }
+          if (F.getName()=="main" && isa<ReturnInst>(BB.getTerminator())) {
+              insert_on_main_end_block(BB, M);
+          }
+      }
+  }
+
+
 
   Function *Ctor = nullptr;
 
@@ -489,6 +764,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
 
   }
 
+
   if (Ctor && Options.PCTable) {
 
     auto SecStartEnd = CreateSecStartEnd(M, SanCovPCsSectionName, IntptrPtrTy);
@@ -506,9 +782,9 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
 
   if (!be_quiet) {
 
-    if (!instr)
+    if (!instr) {
       WARNF("No instrumentation targets found.");
-    else {
+    } else {
 
       char modeline[100];
       snprintf(modeline, sizeof(modeline), "%s%s%s%s%s%s",
@@ -525,6 +801,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
     }
 
   }
+                          llvm::outs() <<  "HEATHER3 \n"; 
 
   return true;
 
@@ -561,8 +838,8 @@ bool isFullPostDominator(const BasicBlock *BB, const PostDominatorTree *PDT) {
 }
 
 bool shouldInstrumentBlock(const Function &F, const BasicBlock *BB,
-                           const DominatorTree            *DT,
-                           const PostDominatorTree        *PDT,
+                           const DominatorTree *           DT,
+                           const PostDominatorTree *       PDT,
                            const SanitizerCoverageOptions &Options) {
 
   // Don't insert coverage for blocks containing nothing but unreachable: we
@@ -653,7 +930,7 @@ void ModuleSanitizerCoverageAFL::instrumentFunction(
   SmallVector<BinaryOperator *, 8>    DivTraceTargets;
   SmallVector<GetElementPtrInst *, 8> GepTraceTargets;
 
-  const DominatorTree     *DT = DTCallback(F);
+  const DominatorTree *    DT = DTCallback(F);
   const PostDominatorTree *PDT = PDTCallback(F);
   bool                     IsLeafFunc = true;
 
@@ -697,11 +974,11 @@ void ModuleSanitizerCoverageAFL::instrumentFunction(
   }
 
   InjectCoverage(F, BlocksToInstrument, IsLeafFunc);
-  InjectCoverageForIndirectCalls(F, IndirCalls);
-  InjectTraceForCmp(F, CmpTraceTargets);
-  InjectTraceForSwitch(F, SwitchTraceTargets);
-  InjectTraceForDiv(F, DivTraceTargets);
-  InjectTraceForGep(F, GepTraceTargets);
+//  InjectCoverageForIndirectCalls(F, IndirCalls);
+//  InjectTraceForCmp(F, CmpTraceTargets);
+//  InjectTraceForSwitch(F, SwitchTraceTargets);
+//  InjectTraceForDiv(F, DivTraceTargets);
+//  InjectTraceForGep(F, GepTraceTargets);
 
 }
 
@@ -710,8 +987,8 @@ GlobalVariable *ModuleSanitizerCoverageAFL::CreateFunctionLocalArrayInSection(
 
   ArrayType *ArrayTy = ArrayType::get(Ty, NumElements);
   auto       Array = new GlobalVariable(
-            *CurModule, ArrayTy, false, GlobalVariable::PrivateLinkage,
-            Constant::getNullValue(ArrayTy), "__sancov_gen_");
+      *CurModule, ArrayTy, false, GlobalVariable::PrivateLinkage,
+      Constant::getNullValue(ArrayTy), "__sancov_gen_");
 
 #if LLVM_VERSION_MAJOR >= 13
   if (TargetTriple.supportsCOMDAT() &&
@@ -799,11 +1076,10 @@ void ModuleSanitizerCoverageAFL::CreateFunctionLocalArrays(
 bool ModuleSanitizerCoverageAFL::InjectCoverage(
     Function &F, ArrayRef<BasicBlock *> AllBlocks, bool IsLeafFunc) {
 
-  uint32_t        cnt_cov = 0, cnt_sel = 0, cnt_sel_inc = 0;
-  static uint32_t first = 1;
+  uint32_t cnt_cov = 0, cnt_sel = 0, cnt_sel_inc = 0;
 
   for (auto &BB : F) {
-
+ 
     for (auto &IN : BB) {
 
       CallInst *callInst = nullptr;
@@ -826,11 +1102,9 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
 
         }
 
-        if (!FuncName.compare(StringRef("__afl_coverage_interesting"))) {
+        if (FuncName.compare(StringRef("__afl_coverage_interesting"))) continue;
 
-          cnt_cov++;
-
-        }
+        cnt_cov++;
 
       }
 
@@ -854,7 +1128,7 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
           if (tt) {
 
             cnt_sel++;
-            cnt_sel_inc += (tt->getElementCount().getKnownMinValue() * 2);
+            cnt_sel_inc += tt->getElementCount().getKnownMinValue();
 
           }
 
@@ -869,8 +1143,7 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
   }
 
   /* Create PCGUARD array */
-  CreateFunctionLocalArrays(F, AllBlocks, first + cnt_cov + cnt_sel_inc);
-  if (first) { first = 0; }
+  CreateFunctionLocalArrays(F, AllBlocks, cnt_cov + cnt_sel_inc);
   selects += cnt_sel;
 
   uint32_t special = 0, local_selects = 0, skip_next = 0;
@@ -924,8 +1197,8 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
       if (!skip_next && (selectInst = dyn_cast<SelectInst>(&IN))) {
 
         uint32_t    vector_cnt = 0;
-        Value      *condition = selectInst->getCondition();
-        Value      *result;
+        Value *     condition = selectInst->getCondition();
+        Value *     result;
         auto        t = condition->getType();
         IRBuilder<> IRB(selectInst->getNextNode());
 
@@ -1056,17 +1329,17 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
         ModuleSanitizerCoverageAFL::SetNoSanitizeMetadata(MapPtr);
 
         /*
-                    std::string errMsg;
-                    raw_string_ostream os(errMsg);
-                    result->print(os);
-                    fprintf(stderr, "X: %s\n", os.str().c_str());
+            std::string errMsg;
+            raw_string_ostream os(errMsg);
+        result->print(os);
+        fprintf(stderr, "X: %s\n", os.str().c_str());
         */
 
         while (1) {
 
           /* Get CurLoc */
           LoadInst *CurLoc = nullptr;
-          Value    *MapPtrIdx = nullptr;
+          Value *   MapPtrIdx = nullptr;
 
           /* Load counter for CurLoc */
           if (!vector_cnt) {
@@ -1165,8 +1438,8 @@ void ModuleSanitizerCoverageAFL::InjectCoverageForIndirectCalls(
   for (auto I : IndirCalls) {
 
     IRBuilder<> IRB(I);
-    CallBase   &CB = cast<CallBase>(*I);
-    Value      *Callee = CB.getCalledOperand();
+    CallBase &  CB = cast<CallBase>(*I);
+    Value *     Callee = CB.getCalledOperand();
     if (isa<InlineAsm>(Callee)) continue;
     IRB.CreateCall(SanCovTracePCIndir, IRB.CreatePointerCast(Callee, IntptrTy));
 
@@ -1187,7 +1460,7 @@ void ModuleSanitizerCoverageAFL::InjectTraceForSwitch(
 
       IRBuilder<>                 IRB(I);
       SmallVector<Constant *, 16> Initializers;
-      Value                      *Cond = SI->getCondition();
+      Value *                     Cond = SI->getCondition();
       if (Cond->getType()->getScalarSizeInBits() >
           Int64Ty->getScalarSizeInBits())
         continue;
@@ -1235,7 +1508,7 @@ void ModuleSanitizerCoverageAFL::InjectTraceForDiv(
   for (auto BO : DivTraceTargets) {
 
     IRBuilder<> IRB(BO);
-    Value      *A1 = BO->getOperand(1);
+    Value *     A1 = BO->getOperand(1);
     if (isa<ConstantInt>(A1)) continue;
     if (!A1->getType()->isIntegerTy()) continue;
     uint64_t TypeSize = DL->getTypeStoreSizeInBits(A1->getType());
@@ -1264,6 +1537,197 @@ void ModuleSanitizerCoverageAFL::InjectTraceForGep(
 
 }
 
+
+void ModuleSanitizerCoverageAFL::AddObj(
+    Module &M, Function *F, Instruction *IN, CmpInst *cmp_inst) {
+
+    LLVMContext& ctx = M.getContext(); 
+
+    auto op0 = cmp_inst->getOperand(0);
+    auto op1 = cmp_inst->getOperand(1); 
+    
+    // Let's focus on integer compares for now
+    IntegerType* int_type_op0 = dyn_cast<IntegerType>(op0->getType());
+    IntegerType* int_type_op1 = dyn_cast<IntegerType>(op1->getType()); 
+
+    if (!int_type_op0 || !int_type_op1) 
+        return;
+
+    // Insert the objective function before the current instruction, IN
+    auto pred = dyn_cast<CmpInst>(cmp_inst)->getPredicate(); 
+
+//    llvm::outs() << "H2\n";
+    
+    Instruction *obj_fn = NULL; 
+    switch(pred) { 
+    case CmpInst::ICMP_UGE: // b - a
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_SGT:
+        obj_fn = BinaryOperator::Create(Instruction::Sub, op1, op0, "objfn", IN);
+        break;
+    case CmpInst::ICMP_SLE: // a - b
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_ULT:
+        obj_fn = BinaryOperator::Create(Instruction::Sub, op0, op1, "objfn", IN);
+        break;
+    case CmpInst::ICMP_EQ: // abs(a - b) or (a - b)^2
+    case CmpInst::ICMP_NE:
+    {
+        Instruction* val = BinaryOperator::Create(Instruction::Sub,
+                                                  op0, op1, "inner", IN);
+        
+        Function *abs_fn;
+        
+        if (M.getFunction("abs")) {
+            abs_fn = M.getFunction("abs");
+        }
+        else {
+            std::vector<Type*> argsTypes;
+            argsTypes.push_back(Type::getInt64Ty(ctx));
+            FunctionCallee abs =
+                M.getOrInsertFunction(
+                    "abs",
+                    FunctionType::get(Type::getInt64Ty(ctx),
+                                      argsTypes, false));
+            abs_fn = dyn_cast<Function>(abs.getCallee());
+        }
+        
+        std::vector<Value*> args;
+        IRBuilder<> builder(IN);
+
+        auto casted_val = builder.CreateIntCast(val, Type::getInt64Ty(ctx), true);
+        args.push_back(casted_val);
+        
+        CallInst *obj_fn_in = CallInst::Create(abs_fn, args, "", IN);
+        if (pred == CmpInst::ICMP_NE) // -abs(a - b) or 1 - (a - b) ^ 2
+        {
+            obj_fn = BinaryOperator::CreateNeg(obj_fn_in, "objfn_ne", IN);
+        } else {
+            obj_fn = obj_fn_in;
+        }
+        break;
+    }
+    default:
+        return;
+    }
+
+//    llvm::outs() << "H3\n";
+
+    // Get some information about this instruction to form an ID
+    const llvm::DebugLoc &debugInfo = IN->getDebugLoc();
+//                        llvm::outs() << "\n" << "debugInfo = " << debugInfo << "\n";
+    Value* fmt_ptr = get_ptr_expr_from_str(M, "%s:%s:%d:%d %d %d %d %d %d\n", "fmt_str");  
+//    llvm::outs() << "\nhere2\n";
+    
+    auto file_name = (debugInfo ? debugInfo->getFilename().data() : "foo");
+//    llvm::outs() << "\nhere2a " << file_name << " \n";                        
+    Type* str_type = Type::getInt8PtrTy(M.getContext()); 
+//    llvm::outs() << "\nhere2b\n";                        
+    Value* file_name_ptr = get_ptr_expr_from_str(M, file_name, "file_name"); 
+//    llvm::outs() << "\nhere2c\n";                        
+    Value* file_name_load = ret_loaded_var(M, str_type,  file_name_ptr, "file_name", IN);                    
+    
+                     //   llvm::outs() << "\nhere3\n";
+    auto fname = F->getName().data();
+    Value* fname_ptr = get_ptr_expr_from_str(M, fname, "fname"); 
+    Value* fname_load = ret_loaded_var(M, str_type, fname_ptr, "fname", IN);  
+                     //   llvm::outs() << "\nhere4\n";
+    
+    int line_no = (debugInfo ? debugInfo->getLine() : 0);
+    llvm::outs() << "file=" << file_name << " line_no= " << line_no << "\n";
+
+     if (line_no == 0) return;
+
+    int col_no = (debugInfo ? debugInfo->getColumn() : 0);
+     llvm::outs() << "\nhere4b " << col_no << "\n";
+    Value* line_ptr = ConstantInt::get(Type::getInt32Ty(M.getContext()), line_no); 
+    Value* col_ptr = ConstantInt::get(Type::getInt32Ty(M.getContext()), col_no); 
+    
+    Value* line_load = ret_loaded_var(M, Type::getInt32Ty(M.getContext()), line_ptr, 
+                                      "line_no", IN); 
+    Value* col_load = ret_loaded_var(M, Type::getInt32Ty(M.getContext()), col_ptr, 
+                                     "col_no", IN); 
+    
+                        llvm::outs() << "\nhere5 " << global_fp << " \n";
+    
+
+
+                        llvm::outs() << "\nhere5a " << global_fp << " \n";
+    if (global_fp) { 
+                        llvm::outs() << "\nhere5b " << global_fp << " \n";
+        global_fp->getType(); 
+    }
+                        llvm::outs() << "\nhere5c " << global_fp << " \n";
+    global_fp->getType()->getElementType(); 
+                        llvm::outs() << "\nhere5d " << global_fp << " \n";
+    Value* load_global_fp = new LoadInst(global_fp->getType()->getElementType(), 
+                                         global_fp, "lgfp", IN); 
+    
+                        llvm::outs() << "\nhere6\n";
+    
+                        llvm::outs() << "\n This instruction is in " << F->getName().data() << ":" << line_no << "\n";
+
+                        llvm::outs() << "\nhere7\n";
+    
+    // Set up the arguments for fprintf
+    std::vector<Value*> args;
+    args.push_back(load_global_fp);
+    args.push_back(fmt_ptr);
+    args.push_back(file_name_load);
+    args.push_back(fname_load); 
+    args.push_back(line_load); 
+    args.push_back(col_load); 
+        
+                        llvm::outs() << "here 8\n";
+    
+    //                    llvm::Type *i32_type = llvm::IntegerType::getInt32Ty(llvm_context);
+    auto vpred = ConstantInt::get(Type::getInt32Ty(ctx), pred);
+    //                    llvm::Constant *i32_val = llvm::ConstantInt::get(i32_type, -1/*value*/, true);
+    
+    args.push_back(vpred);
+    args.push_back(op0);
+    args.push_back(op1);
+    
+    
+    auto lhs = dyn_cast<Value>(cmp_inst);
+    args.push_back(lhs);
+    args.push_back(obj_fn); 
+    //                    obj_fn->print(llvm::outs());
+    
+    
+    // Get the argument types for fprintf 
+    std::vector<Type*> argsTypes;
+    for (unsigned i = 0; i < args.size(); i++) {
+        argsTypes.push_back(args[i]->getType());
+    }
+    // Get the fprintf function
+    Function* fprintf_fn; 
+    if (M.getFunction("fprintf")) { 
+        fprintf_fn = M.getFunction("fprintf");  
+    } else {
+        FunctionCallee fprintf = M.getOrInsertFunction("fprintf", 
+                                                       FunctionType::get(Type::getInt32Ty(ctx), argsTypes, true));
+        fprintf_fn = dyn_cast<Function>(fprintf.getCallee()); 
+    }
+    //                    printf("\n%p\nThis is fprintf fn: \n", fprintf_fn);
+    //                    fprintf_fn->print(llvm::outs());
+    //                    printf("\nThis is fprintf call: \n");
+    IRBuilder<> builder(IN);
+    builder.SetInsertPoint(IN->getNextNode());
+    builder.CreateCall(fprintf_fn, args, "");
+    
+    //                    CallInst* fprintf_call = CallInst::Create(fprintf_fn, args, "", nullptr); 
+    //                    BI->getInstList()->insertAfter(fprintf_call);
+    
+    
+    //                    CallInst* fprintf_call = CallInst::Create(fprintf_fn, args, "", IN); 
+    //                    fprintf_call->print(llvm::outs());
+    //                    fprintf_call->setTailCall(true);
+}
+
+
 void ModuleSanitizerCoverageAFL::InjectTraceForCmp(
     Function &, ArrayRef<Instruction *> CmpTraceTargets) {
 
@@ -1272,8 +1736,8 @@ void ModuleSanitizerCoverageAFL::InjectTraceForCmp(
     if (ICmpInst *ICMP = dyn_cast<ICmpInst>(I)) {
 
       IRBuilder<> IRB(ICMP);
-      Value      *A0 = ICMP->getOperand(0);
-      Value      *A1 = ICMP->getOperand(1);
+      Value *     A0 = ICMP->getOperand(0);
+      Value *     A1 = ICMP->getOperand(1);
       if (!A0->getType()->isIntegerTy()) continue;
       uint64_t TypeSize = DL->getTypeStoreSizeInBits(A0->getType());
       int      CallbackIdx = TypeSize == 8    ? 0
@@ -1306,7 +1770,7 @@ void ModuleSanitizerCoverageAFL::InjectTraceForCmp(
 
 }
 
-void ModuleSanitizerCoverageAFL::InjectCoverageAtBlock(Function   &F,
+void ModuleSanitizerCoverageAFL::InjectCoverageAtBlock(Function &  F,
                                                        BasicBlock &BB,
                                                        size_t      Idx,
                                                        bool        IsLeafFunc) {
@@ -1425,7 +1889,7 @@ void ModuleSanitizerCoverageAFL::InjectCoverageAtBlock(Function   &F,
   if (Options.StackDepth && IsEntryBB && !IsLeafFunc) {
 
     // Check stack depth.  If it's the deepest so far, record it.
-    Module   *M = F.getParent();
+    Module *  M = F.getParent();
     Function *GetFrameAddr = Intrinsic::getDeclaration(
         M, Intrinsic::frameaddress,
         IRB.getInt8PtrTy(M->getDataLayout().getAllocaAddrSpace()));
@@ -1478,4 +1942,27 @@ std::string ModuleSanitizerCoverageAFL::getSectionEnd(
   return "__stop___" + Section;
 
 }
+
+#if 0
+
+char ModuleSanitizerCoverageLegacyPass::ID = 0;
+INITIALIZE_PASS_BEGIN(ModuleSanitizerCoverageLegacyPass, "sancov",
+                      "Pass for instrumenting coverage on functions", false,
+                      false)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(PostDominatorTreeWrapperPass)
+INITIALIZE_PASS_END(ModuleSanitizerCoverageLegacyPass, "sancov",
+                    "Pass for instrumenting coverage on functions", false,
+                    false)
+ModulePass *llvm::createModuleSanitizerCoverageLegacyPassPass(
+    const SanitizerCoverageOptions &Options,
+    const std::vector<std::string> &AllowlistFiles,
+    const std::vector<std::string> &BlocklistFiles) {
+
+  return new ModuleSanitizerCoverageLegacyPass(Options, AllowlistFiles,
+                                               BlocklistFiles);
+
+}
+
+#endif
 
