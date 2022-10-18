@@ -223,7 +223,9 @@ class ModuleSanitizerCoverageAFL
 };
 
 
+// New code start
 
+// New function
 Value* get_ptr_expr_from_str(Module& M, std::string str, std::string name) { 
     Constant* constant_str = ConstantDataArray::getString(M.getContext(), str, true); 
     GlobalVariable* str_var = new GlobalVariable(M, constant_str->getType(),
@@ -239,13 +241,15 @@ Value* get_ptr_expr_from_str(Module& M, std::string str, std::string name) {
     return str_ptr;
 }
 
-
+// New function 
 Value* ret_loaded_var(Module &M, Type* typ, Value* val, std::string label, Instruction* IN) {  
     auto var = new AllocaInst(typ, 0, label, IN);
     auto store = new StoreInst(val, var, IN); 
     auto load = new LoadInst(var->getType()->getElementType(), var, label, IN);
     return load;
 } 
+
+// New code end 
 
 
 class ModuleSanitizerCoverageLegacyPass : public ModulePass {
@@ -414,29 +418,26 @@ Function *ModuleSanitizerCoverageAFL::CreateInitCallsForSections(
 
 }
 
+// New code start 
 
+// New function 
 bool IsInterestingCmp(ICmpInst *CMP, const DominatorTree *DT,
                       const SanitizerCoverageOptions &Options);
 
 
 
+// New function 
+// In the main fn, we need to insert a call to fopen and save the result in a global file pointer
 bool ModuleSanitizerCoverageAFL::insert_on_main_entry_block(BasicBlock &F, Module &M) {
     llvm::outs() <<  "inserting on main entry... \n"; 
 
     // Get the first instruction in this block
     Instruction *inst = F.getFirstNonPHI();
 
-    int is_return = 0;
+    // Nothing to instrument but we CANNOT just return 
     if (ReturnInst *r = dyn_cast<ReturnInst>(inst)) {
-        // hmm looks like main is *empty
-        llvm::outs() <<  "main is empty...returning\n"; 
-        is_return = 1;
-        //return false ;
-	//return true;
+        llvm::outs() <<  "main is empty...continuing\n"; 
     }
-    llvm::outs() <<  "inserting on main entry2... \n"; 
-
-//    llvm::outs() << "inst = " << inst << " \n";
 
     // FILE * fp
     StructType* io_file_struct_type = StructType::create(M.getContext(), "struct._IO_FILE");
@@ -472,50 +473,41 @@ bool ModuleSanitizerCoverageAFL::insert_on_main_entry_block(BasicBlock &F, Modul
     args.push_back(file_ptr);
     args.push_back(fmt_ptr);
 
-//    llvm::outs() << "here 11 \n";
-
-    Instruction* fp = CallInst::Create(fopen_fn, args, "", inst->getNextNode()); 
+    // **Create the fopen call instruction, right BEFORE our first instruction, inst
+    Instruction* fp; 
+    fp = CallInst::Create(fopen_fn, args, "", inst); 
 
     // Create the global file pointer 
     M.getOrInsertGlobal("global_fp", fp->getType()); 
-                        llvm::outs() << "\nhere1a " << fp << " \n";
-                        llvm::outs() << "\nhere1a " << fp->getType() << " \n";
     global_fp  = M.getNamedGlobal("global_fp"); 
-                        llvm::outs() << "\nhere1b " << global_fp << " \n";
     global_fp->setLinkage(llvm::GlobalValue::CommonLinkage);
     global_fp->setAlignment(Align(8));
 
-    llvm::outs() << "here 12 \n";
-
+    // Create global file pointer initializer with the fopen call 
     PointerType* pt = dyn_cast<PointerType>(fp->getType()); 
     Constant* init_null  = ConstantPointerNull::get(pt);
     global_fp->setInitializer(init_null);
 
-    llvm::outs() << "here 14 \n";
-
+    llvm::outs() << " inst : " << inst << "\n";
     llvm::outs() << " fp : " << fp << "\n";
     llvm::outs() << " global_fp : " << global_fp << "\n";
     
-    fp->getNextNode(); 
-    llvm::outs() << "here 15 \n";
-    llvm::outs() << " fp : " << fp->getNextNode() << "\n";
+    llvm::outs() << " fp->getNextNode : " << fp->getNextNode() << "\n";
 
+
+    // Store instruction for the global file pointer
      StoreInst* stinst; 
-    if (is_return) { 
-        stinst = new StoreInst(fp, global_fp, inst);
-    } else {
-
-        stinst = new StoreInst(fp, global_fp, fp->getNextNode());
-    }
+    // Is fp->getNextNode() just equivalent to instr?
+    //stinst = new StoreInst(fp, global_fp, fp->getNextNode());
+    stinst = new StoreInst(fp, global_fp, inst);
 
     llvm::outs() << "here 16 \n";
-
-
 
     return true;
 
 }
 
+// New function 
 void ModuleSanitizerCoverageAFL::insert_extern_fp(Module &M) {
 
     // FILE * fp
@@ -530,6 +522,7 @@ void ModuleSanitizerCoverageAFL::insert_extern_fp(Module &M) {
 }
 
 
+// New function 
 bool ModuleSanitizerCoverageAFL::insert_on_main_end_block(BasicBlock &F, Module &M) {
     llvm::outs() <<  "inserting on main end... \n"; 
     Instruction *inst = F.getTerminator();
@@ -555,6 +548,7 @@ bool ModuleSanitizerCoverageAFL::insert_on_main_end_block(BasicBlock &F, Module 
     return true;
 }
 
+// New code end 
 
 bool ModuleSanitizerCoverageAFL::instrumentModule(
     Module &M, DomTreeCallback DTCallback, PostDomTreeCallback PDTCallback) {
@@ -614,16 +608,17 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   Int8Ty = IRB.getInt8Ty();
   Int1Ty = IRB.getInt1Ty();
   LLVMContext &Ctx = M.getContext();
-  
-    // determine if this module contains main
+
+
+  // New code start 
+    // Determine if this module contains main, so we can insert 
+    // necessary main code 
     bool found_main = false;    
-    bool insert_success = false;
     for(Module::iterator F = M.begin();  F != M.end(); ++F) 
         if (F->getName() == "main") {
             found_main = true;    
             // we have main -- insert fopen of global fp
             llvm::outs() << "found main -- inserting open of global fp\n";
-            insert_success = insert_on_main_entry_block(F->getEntryBlock(), M); 
             insert_on_main_entry_block(F->getEntryBlock(), M); 
         }
     
@@ -631,6 +626,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
         // no main -- insert extern of global fp
         insert_extern_fp(M);
     }
+  // New code end 
 
 
   AFLMapPtr =
@@ -710,6 +706,10 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
 
   for (auto &F : M) {
       instrumentFunction(F, DTCallback, PDTCallback);     
+      // New code start
+
+      // We need to find all ICMP instructions so we can add objective function
+      // instrumentation right before 
 //          llvm::outs() << "Fn name = " << F.getName() << "\n";
       for (auto &BB : F) {
 //          llvm::outs() << " block\n";
@@ -722,6 +722,7 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
 //                      llvm::outs() << "... interesting\n";
                       CmpInst* cmp_inst = dyn_cast<CmpInst>(&Inst);
                       if (cmp_inst) {
+                          // Found our ICMP instructions
 //                          llvm::outs() << "Adding objfn\n";                          
                           Instruction *IN = &Inst;
                           Function *Fp = &F;
@@ -742,8 +743,8 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
               insert_on_main_end_block(BB, M);
           }
       }
+      // New code end 
   }
-
 
 
   Function *Ctor = nullptr;
@@ -801,7 +802,6 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
     }
 
   }
-                          llvm::outs() <<  "HEATHER3 \n"; 
 
   return true;
 
@@ -1538,6 +1538,8 @@ void ModuleSanitizerCoverageAFL::InjectTraceForGep(
 }
 
 
+// New code start
+// New function 
 void ModuleSanitizerCoverageAFL::AddObj(
     Module &M, Function *F, Instruction *IN, CmpInst *cmp_inst) {
 
@@ -1621,8 +1623,10 @@ void ModuleSanitizerCoverageAFL::AddObj(
     Value* fmt_ptr = get_ptr_expr_from_str(M, "%s:%s:%d:%d %d %d %d %d %d\n", "fmt_str");  
 //    llvm::outs() << "\nhere2\n";
     
+
+
     auto file_name = (debugInfo ? debugInfo->getFilename().data() : "foo");
-//    llvm::outs() << "\nhere2a " << file_name << " \n";                        
+    llvm::outs() << "\nhere2a " << file_name << " \n";                        
     Type* str_type = Type::getInt8PtrTy(M.getContext()); 
 //    llvm::outs() << "\nhere2b\n";                        
     Value* file_name_ptr = get_ptr_expr_from_str(M, file_name, "file_name"); 
@@ -1701,6 +1705,7 @@ void ModuleSanitizerCoverageAFL::AddObj(
     std::vector<Type*> argsTypes;
     for (unsigned i = 0; i < args.size(); i++) {
         argsTypes.push_back(args[i]->getType());
+        args[i]->getType()->print(llvm::outs());
     }
     // Get the fprintf function
     Function* fprintf_fn; 
@@ -1726,6 +1731,7 @@ void ModuleSanitizerCoverageAFL::AddObj(
     //                    fprintf_call->print(llvm::outs());
     //                    fprintf_call->setTailCall(true);
 }
+// New code end 
 
 
 void ModuleSanitizerCoverageAFL::InjectTraceForCmp(
