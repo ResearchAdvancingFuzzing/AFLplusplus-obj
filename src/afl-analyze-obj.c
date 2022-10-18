@@ -355,7 +355,12 @@ static void analyze_run_target(u8 *mem, u32 len) {
           }
           fclose(RF);
 
-          remove("results.txt");
+          //remove("results.txt");
+          // We need to clear the contents of the file, not remove it 
+          // Also  maybe we should change the instrumentation so that it just overwrites the file 
+          // instead of appending; may save us some headaches
+          fclose(fopen("results.txt", "w"));
+          
       }
 
 
