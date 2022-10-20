@@ -501,7 +501,7 @@ bool ModuleSanitizerCoverageAFL::insert_on_main_entry_block(BasicBlock &F, Modul
     //stinst = new StoreInst(fp, global_fp, fp->getNextNode());
     stinst = new StoreInst(fp, global_fp, inst);
 
-    llvm::outs() << "here 16 \n";
+    //llvm::outs() << "here 16 \n";
 
     return true;
 
@@ -1543,6 +1543,15 @@ void ModuleSanitizerCoverageAFL::InjectTraceForGep(
 void ModuleSanitizerCoverageAFL::AddObj(
     Module &M, Function *F, Instruction *IN, CmpInst *cmp_inst) {
 
+    // Not sure if this will work 
+    const llvm::DebugLoc &debugInfo_help = IN->getDebugLoc();
+    auto fname_test = (debugInfo_help ? debugInfo_help->getFilename().data() : StringRef("foo"));
+    if (!fname_test.compare(StringRef("./doc/chew.c")))  {
+        printf("FOUND CHEW.C\n");
+        return;
+    }
+
+
     LLVMContext& ctx = M.getContext(); 
 
     auto op0 = cmp_inst->getOperand(0);
@@ -1558,7 +1567,6 @@ void ModuleSanitizerCoverageAFL::AddObj(
     // Insert the objective function before the current instruction, IN
     auto pred = dyn_cast<CmpInst>(cmp_inst)->getPredicate(); 
 
-//    llvm::outs() << "H2\n";
     
     Instruction *obj_fn = NULL; 
     switch(pred) { 
@@ -1615,65 +1623,46 @@ void ModuleSanitizerCoverageAFL::AddObj(
         return;
     }
 
-//    llvm::outs() << "H3\n";
 
-    // Get some information about this instruction to form an ID
+    // Get some debug information about this instruction to form an ID
     const llvm::DebugLoc &debugInfo = IN->getDebugLoc();
-//                        llvm::outs() << "\n" << "debugInfo = " << debugInfo << "\n";
     Value* fmt_ptr = get_ptr_expr_from_str(M, "%s:%s:%d:%d %d %d %d %d %d\n", "fmt_str");  
-//    llvm::outs() << "\nhere2\n";
-    
 
-
+    // File name
     auto file_name = (debugInfo ? debugInfo->getFilename().data() : "foo");
-    llvm::outs() << "\nhere2a " << file_name << " \n";                        
     Type* str_type = Type::getInt8PtrTy(M.getContext()); 
-//    llvm::outs() << "\nhere2b\n";                        
     Value* file_name_ptr = get_ptr_expr_from_str(M, file_name, "file_name"); 
-//    llvm::outs() << "\nhere2c\n";                        
     Value* file_name_load = ret_loaded_var(M, str_type,  file_name_ptr, "file_name", IN);                    
     
-                     //   llvm::outs() << "\nhere3\n";
+    // Function name
     auto fname = F->getName().data();
     Value* fname_ptr = get_ptr_expr_from_str(M, fname, "fname"); 
     Value* fname_load = ret_loaded_var(M, str_type, fname_ptr, "fname", IN);  
-                     //   llvm::outs() << "\nhere4\n";
     
+    // Line number 
     int line_no = (debugInfo ? debugInfo->getLine() : 0);
-    llvm::outs() << "file=" << file_name << " line_no= " << line_no << "\n";
+    llvm::outs() << "file=" << file_name << " fname= " << fname << " line_no= " << line_no << "\n";
+    if (line_no == 0) return;
 
-     if (line_no == 0) return;
-
+    // Column number 
     int col_no = (debugInfo ? debugInfo->getColumn() : 0);
-     llvm::outs() << "\nhere4b " << col_no << "\n";
+
     Value* line_ptr = ConstantInt::get(Type::getInt32Ty(M.getContext()), line_no); 
     Value* col_ptr = ConstantInt::get(Type::getInt32Ty(M.getContext()), col_no); 
-    
     Value* line_load = ret_loaded_var(M, Type::getInt32Ty(M.getContext()), line_ptr, 
                                       "line_no", IN); 
     Value* col_load = ret_loaded_var(M, Type::getInt32Ty(M.getContext()), col_ptr, 
                                      "col_no", IN); 
-    
-                        llvm::outs() << "\nhere5 " << global_fp << " \n";
-    
 
-
-                        llvm::outs() << "\nhere5a " << global_fp << " \n";
-    if (global_fp) { 
-                        llvm::outs() << "\nhere5b " << global_fp << " \n";
-        global_fp->getType(); 
-    }
-                        llvm::outs() << "\nhere5c " << global_fp << " \n";
-    global_fp->getType()->getElementType(); 
-                        llvm::outs() << "\nhere5d " << global_fp << " \n";
+    // llvm::outs() << "Global fp:  " << global_fp << " \n";
     Value* load_global_fp = new LoadInst(global_fp->getType()->getElementType(), 
                                          global_fp, "lgfp", IN); 
     
-                        llvm::outs() << "\nhere6\n";
+                        //llvm::outs() << "\nhere6\n";
     
-                        llvm::outs() << "\n This instruction is in " << F->getName().data() << ":" << line_no << "\n";
+                        //llvm::outs() << "This instruction is in " << F->getName().data() << ":" << line_no << "\n";
 
-                        llvm::outs() << "\nhere7\n";
+                        //llvm::outs() << "\nhere7\n";
     
     // Set up the arguments for fprintf
     std::vector<Value*> args;
@@ -1684,7 +1673,7 @@ void ModuleSanitizerCoverageAFL::AddObj(
     args.push_back(line_load); 
     args.push_back(col_load); 
         
-                        llvm::outs() << "here 8\n";
+                        //llvm::outs() << "here 8\n";
     
     //                    llvm::Type *i32_type = llvm::IntegerType::getInt32Ty(llvm_context);
     auto vpred = ConstantInt::get(Type::getInt32Ty(ctx), pred);
@@ -1705,7 +1694,7 @@ void ModuleSanitizerCoverageAFL::AddObj(
     std::vector<Type*> argsTypes;
     for (unsigned i = 0; i < args.size(); i++) {
         argsTypes.push_back(args[i]->getType());
-        args[i]->getType()->print(llvm::outs());
+        //args[i]->getType()->print(llvm::outs());
     }
     // Get the fprintf function
     Function* fprintf_fn; 
