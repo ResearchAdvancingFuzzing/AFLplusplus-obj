@@ -528,6 +528,7 @@ void ModuleSanitizerCoverageAFL::insert_extern_fp(Module &M) {
 
 // New function 
 // At the end of our main block, we need to close our global file pointer
+// We also need to flush
 bool ModuleSanitizerCoverageAFL::insert_on_main_end_block(BasicBlock &F, Module &M) {
     llvm::outs() <<  "inserting on main end... \n"; 
     Instruction *inst = F.getTerminator();
@@ -544,11 +545,25 @@ bool ModuleSanitizerCoverageAFL::insert_on_main_end_block(BasicBlock &F, Module 
     }
     //    printf("\nThis if fclose: \n");
     //    fclose_fn->print(llvm::outs()); 
+    //
+    Function* fflush_fn; 
+    if (M.getFunction("fflush")) { 
+        fflush_fn = M.getFunction("fflush"); 
+    } else { 
+        FunctionCallee const_fflush = M.getOrInsertFunction("fflush", 
+                FunctionType::get(Type::getInt32Ty(ctx), global_fp->getType()->getElementType(), true));
+        fflush_fn = cast<Function>(const_fflush.getCallee());
+    }
 
     Value* load_global_fp = new LoadInst(global_fp->getType()->getElementType(), 
             global_fp, "lgfp", inst); 
+
+
     CallInst* fclose_fn_call = CallInst::Create(fclose_fn, load_global_fp, "", inst); 
     fclose_fn_call->setCallingConv(CallingConv::C);
+
+    CallInst* fflush_fn_call = CallInst::Create(fflush_fn, load_global_fp, "", fclose_fn_call); 
+    fflush_fn_call->setCallingConv(CallingConv::C);
 
     return true;
 }
@@ -1555,7 +1570,6 @@ void ModuleSanitizerCoverageAFL::AddObj(
         return;
     }
 
-
     LLVMContext& ctx = M.getContext(); 
 
     auto op0 = cmp_inst->getOperand(0);
@@ -1630,6 +1644,7 @@ void ModuleSanitizerCoverageAFL::AddObj(
 
     // Get some debug information about this instruction to form an ID
     const llvm::DebugLoc &debugInfo = IN->getDebugLoc();
+    // <file_name>:<function>:<line>:<col>:<vpred>:<op0>:<op1>:<lhs>:<obj_fn>
     Value* fmt_ptr = get_ptr_expr_from_str(M, "%s:%s:%d:%d %d %d %d %d %d\n", "fmt_str");  
 
     // File name
