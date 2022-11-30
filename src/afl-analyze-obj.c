@@ -87,6 +87,9 @@ static u32 map_size = MAP_SIZE;
 
 static afl_forkserver_t fsrv = {0};   /* The forkserver                     */
 
+static char * ending_line = NULL;
+static ssize_t ending_bytes = 0;
+
 
 // keep track of 1st values for obj_fn for each pp
 Vslht *obj_fn_orig = NULL;
@@ -244,21 +247,74 @@ static void analyze_run_target(u8 *mem, u32 len) {
       
       {
           FILE *RF=fopen("results.txt", "r");
+          fflush(RF);
           assert (RF != NULL);
           static char * line = NULL;
           size_t len = 256;
-          ssize_t read;
+          ssize_t read = 0;
 
           if (line == NULL)
               line = (char *) malloc(len);
+          
 
           int l=0;
           while (true) {
-//              printf ("line=%d\n", l);
-              l++;
-              read = getline(&line, &len, RF);
-              if (read == -1) 
+
+
+              char * ret; 
+              if (l==0 && ending_line && ending_bytes) { 
+                  // If we are reading the first line and there was a problem with it finishing last time
+                  // Than this first line is probably broken/partial so let's fix it
+
+                  //printf("ending line: %s\n", ending_line); 
+                  //printf("ending bytes: %ld\n", ending_bytes); 
+                  
+                  char * first_line = (char*) malloc(len); 
+
+                  // Copy in our last/previous partial line and null-terminate 
+                  strncpy(first_line, ending_line, ending_bytes); 
+                  first_line[ending_bytes] = 0;
+
+                  // Read in our first partial line 
+                  read = getline(&line, &len, RF);
+                  //printf("line: %s, line_bytes: %ld\n", line, read);
+
+                  // Add our first line to then end of our previous line
+                  strncat(first_line, line, read);
+                  //printf("Fixed line: %s\n", first_line); 
+                  //printf("done\n");
+                  
+                  // Copy it over into line  
+                  strncpy(line, first_line, ending_bytes + read); 
+                  
+                  free(first_line);
+              }
+              else { 
+                  // Every other line we are reading in 
+                read = getline(&line, &len, RF);
+              }
+              
+              //printf("Line ON: %s, read: %ld\n", line, read); 
+              // When to break
+
+              if (read == -1) { 
+                  // We're just done, reached EOF
+                  //printf("done. line=%d ", l); 
                   break;
+              }
+              ret = strchr(line, '\n'); 
+              //printf("ret: %s, line %d: %s, bytes: %ld \n", ret, l, line, read); 
+              if (!ret) { 
+                  // We don't have a full line, we can't process it
+                  // We need to save the line and use it on the next read of the file  
+                  // This is kind of a premature stop, we will always reach this before EOF
+                  //printf("1 No newline. Need to fix.\n"); 
+                  ending_line = line;
+                  ending_bytes = read;
+                  break;
+              } 
+
+              l++;
               char delim[] = " ";
               char *ptr = strtok(line, delim);              
               int f = 0;
@@ -266,7 +322,7 @@ static void analyze_run_target(u8 *mem, u32 len) {
               int lhs=-1;
               int obj_fn=-1;
               while(ptr != NULL)  {
-//                  printf("'%s'\n", ptr);
+                  //printf("'%s'\n", ptr);
                   if (f==0) pp = ptr;
                   if (f==4) lhs = atoi(ptr);
                   if (f==5) obj_fn = atoi(ptr);
@@ -289,6 +345,8 @@ static void analyze_run_target(u8 *mem, u32 len) {
                   }
 
                   if (sih_mem(all_pp, pp) == false) {
+                      //printf ("line no=%d, line= %s\n", l, line);
+                      //printf("pp= [%s]\n", pp); 
                       sih_add(all_pp, pp, 1);
                       assert (sih_mem(all_pp, pp));
                   }
@@ -353,12 +411,9 @@ static void analyze_run_target(u8 *mem, u32 len) {
                   }
               }
           }
-          fclose(RF);
-
+          fclose(RF); 
           //remove("results.txt");
           // We need to clear the contents of the file, not remove it 
-          // Also  maybe we should change the instrumentation so that it just overwrites the file 
-          // instead of appending; may save us some headaches
           fclose(fopen("results.txt", "w"));
           
       }
@@ -737,6 +792,7 @@ void spit_sih(Vslht *sih, char *label) {
             continue;
         String *key = (String*) bin->key;
         int value = *((int *) bin->value);
+        //printf("bin #: %d\n", i); 
         printf("%s %d %s -> %d\n", label, j++, key->str, value);
     }
 }    
